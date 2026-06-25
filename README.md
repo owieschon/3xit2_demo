@@ -2,90 +2,125 @@
 
 [![prove](https://github.com/owieschon/3xit2.demo/actions/workflows/prove.yml/badge.svg)](https://github.com/owieschon/3xit2.demo/actions/workflows/prove.yml)
 
-You walk away from the keyboard. The agent comes back and says "done."
+You start an agent on a task, walk away, and come back to "done." But "done" is
+the model's opinion. It may have weakened the test that was failing, run a
+subset of the suite, or never exercised the code path it claims to have fixed —
+and it can reach past the task on its way there: push the branch, rewrite
+history, install a dependency, or edit the very checks that are supposed to
+grade it. The first kind of failure is silent until something breaks
+downstream. The second is one careless command away.
 
-That word is the whole problem. "Done" might mean it weakened a test, ran a
-subset, edited the code path nobody calls, or never exercised the thing it
-claims to have fixed. By the time you find out, the bad change is already in.
-I've spent enough years where a confident wrong answer gets caught downstream —
-on a loading dock, in a customer's hands — to not trust an agent's word that
-its work is finished. So I don't. I made the word mean something.
+3xit2 drops into a repo and makes the first failure *mechanically verifiable*
+and the second *hard to reach by accident*. It adds three things and nothing
+else — no service, no daemon, no package to install. The hard dependency list
+is `git`, `bash`, `python3`; all 24 of its Python files import the standard
+library only.
 
-3xit2 turns "done" into a mechanical decision the agent doesn't get to make.
+## The three components
 
-## What it actually checks
+**1. Boundary guards** — Claude Code PreToolUse hooks
+(`.claude/hooks/guard_bash.py`, `.claude/hooks/guard_files.py`) that block a
+fixed set of operations before they run. The bash guard refuses `push` and
+force-push (including via `bash -c`, env-var prefixes, `git -c
+core.hooksPath=`, `git -c alias.*`, and `GIT_CONFIG_*` injection), `merge`,
+history rewrites (`rebase`/`filter-branch`/`update-ref`), `reset --hard`,
+`commit --amend`, force-deleting branches, dependency adds (`npm/pip/cargo/...
+add`), DB migrations, and HEAD-moving ops when there is unpushed work. The file
+guard makes the trust layer itself read-only to the agent: any write to
+`rails/verifier/`, `.claude/hooks/`, `.claude/settings.json`, the adversarial
+eval, or a test listed in `rails/verifier/load_bearing.txt` is refused
+(symlink- and case-fold-resolved, so `RAILS/VERIFIER/...` on macOS doesn't slip
+through). The agent can add coverage in new files; it can't touch the ones that
+judge it. Both guards fail *closed* — unparseable input blocks.
 
-When the agent claims a task is complete, the verifier re-derives that from
-reality instead of taking its word:
+**2. The verifier** (`rails/verifier/verify.sh`) — what actually decides
+"done." When the agent claims a task complete, the verifier re-derives the
+answer from the current tree instead of trusting the claim. It:
 
-- **Re-runs the full suite** and checks the test count against a frozen
-  baseline, so a deleted test can't hide.
-- **Greps the diff onto the live path** — the changed code has to be reachable,
-  not dead.
-- **Demonstrates red→green** for each obligation: it reverts the fix, proves the
-  test goes red, restores it, proves it goes green. A test that passes with the
-  fix removed proves nothing.
-- **Stamps the verdict with a working-tree hash**, so a stale PASS can't be
-  reused after the tree changes.
+- re-runs the **full test suite** and checks the count against a frozen
+  baseline — a run that exits 0 but collects fewer tests than the baseline is a
+  false green and fails (`full_suite`);
+- confirms the named **load-bearing tests** were actually collected by name, and
+  not merely collected but skipped/xfailed (`load_bearing`,
+  `exercised_assertions`);
+- **greps the changed code onto the live path** — each declared pattern must
+  match a line in a file the dispatch actually changed, so a fix to dead code or
+  a decoy grep at unrelated shipped code fails (`live_path`);
+- proves **demonstrated red→green** for each obligation: revert the fix, prove
+  the test goes red, restore it, prove it goes green again. A test that still
+  passes with the fix removed proves nothing (`demonstrated_red`);
+- checks the agent didn't silently mutate the tests that grade it
+  (`oracle_integrity`), and that the **trust layer itself is still proven** —
+  if the governor's fingerprint differs from the one stamped at the last eval
+  pass, it refuses to certify anything until the eval is re-run
+  (`governor_proven`).
 
-Two hooks sit in front of that. `guard_files.py` and `guard_bash.py` are
-PreToolUse boundary guards that block push/merge/force-rebase/amend, dependency
-adds, and — the cardinal rule — **any write to the trust layer itself**. The
-verifier, the hooks, the settings, and the eval are read-only to the loop. A
-`Stop` gate refuses to let a session end mid-task without a fresh PASS.
+It writes `rails/evidence/<id>/verdict.json` stamped with a hash of the working
+tree. `--update-baseline` (and lowering the baseline with `--allow-shrink`) is
+human-only — the bash guard blocks the agent from invoking it.
 
-## The part I care about: the judge proves itself
+**3. The Stop gate** (`.claude/hooks/gate_stop.py`) — a Stop hook that refuses
+to end a session while a dispatch is active unless the verifier produced a fresh
+`PASS` whose stamped tree hash matches the *current* tree. Stale green is not
+green: change a byte after the verifier ran and the PASS no longer counts. The
+only other way out is for the agent to formally declare itself blocked
+(`rails/handoff/<id>.BLOCKED.md`, stating what it needs from the human). This
+gate fails *open* by deliberate design — it gets its input from Claude Code, not
+the agent, and a hook that fails closed would brick the session rather than
+deny one command. The asymmetry is documented in the code.
 
-It's easy to write a checker. It's the whole game to know the checker actually
-fires. So the trust layer ships with an adversarial eval — **50 cases, 48 core
-+ 2 kit-dev** — that builds a disposable sandbox for each one, injects a real
-violation (a weakened check, an off-path fix, a forged verdict, a stale green, a
-git-config push vector, an untracked-content swap), and proves the right guard
-or verifier check catches it without falsely flagging clean work.
+## The judge proves itself
+
+Writing a checker is easy; knowing it actually fires is the whole game. So the
+trust layer ships its own adversarial eval — **50 cases (48 core + 2 kit-dev)**
+under `rails/adversarial/cases/`. Each builds a disposable sandbox, injects one
+real violation — a weakened check, an off-live-path fix, a vacuous test, a
+forged verdict, a stale green at the Stop gate, a `git -c` push vector, a
+case-variant path, an untracked-content swap — and asserts that the specific
+guard or verifier check catches it, *and* that clean work is not falsely
+flagged.
 
 ```bash
-bash rails/adversarial/run_eval.sh
+bash rails/adversarial/run_eval.sh     # builds 50 sandboxes; give it a minute
 ```
 
-Runs on this clean checkout, exit 0, all 50 PASS. It builds 50 sandboxes, so
-give it a couple of minutes. CI re-runs it on every push and PR — but with
-`RAILS_NO_STAMP=1`, so **CI proves and is forbidden to stamp**. Marking the
-trust layer "proven" stays a local, human-released act. The agent being judged
-cannot edit the judge, freeze its own manifest, or write its own pass.
-
-This is the claim. The measurement of whether enforcement like this actually
-cuts an agent's defect rate is a separate preregistered experiment —
-[code_ver / TrustLadder](https://github.com/owieschon).
+It passes with zero failures on a clean checkout. CI (`.github/workflows/prove.yml`)
+re-runs it on every push and PR with `RAILS_NO_STAMP=1`, and additionally runs
+`verify.sh` end-to-end against a fixture dispatch — so CI *proves* the layer but
+is forbidden to *stamp* it. Marking the trust layer proven stays a local,
+human-released act. The agent being judged cannot edit the judge, freeze its own
+proof obligations, or write its own PASS.
 
 ## Run it
-
-Zero runtime dependencies: `git`, `bash`, `python3`. All 24 Python files are
-stdlib only — nothing to install. Drops into a repo:
 
 ```bash
 ./install.sh /path/to/your/repo     # never clobbers existing files
 ```
 
-Then fill `rails/config.json` (test command, count regex, branch), seed the
-baseline, and run the eval to stamp the registry. The full daily workflow —
-dispatch, approve, walk away, read the handoff — is in
-[`docs/OPERATING.md`](docs/OPERATING.md).
+Then edit `rails/config.json` (test command, count regex, branch), seed the
+baseline from a known-good run, and run the eval to stamp the registry:
 
-## Honest about the edge
+```bash
+bash rails/verifier/verify.sh BOOTSTRAP --update-baseline   # seed baseline
+bash rails/adversarial/run_eval.sh                          # prove + stamp
+```
 
-This is a discipline tool for a well-meaning agent that cuts corners under
-pressure, not a sandbox against a hostile one. The bash guard is a pattern
-matcher: it can't stop an agent that writes files through a language
-interpreter. That class is architectural and closed by the optional
-[`isolate/`](isolate/) container — trust layer mounted read-only, network off,
-a kernel boundary instead of a pattern. The guards fail closed; the Stop gate
-fails open by deliberate design. Every hole I reproduced, what's closed and the
-one that's open-by-design, is in [`AUDIT.md`](AUDIT.md) — a real self-audit,
-re-run in disposable sandboxes, not a disclaimer.
+Restart Claude Code in the repo to pick up `.claude/settings.json`. The full
+daily loop — drop a spec in `rails/dispatches/inbox/`, `/dispatch`, approve,
+walk away, read the handoff — is in [`docs/OPERATING.md`](docs/OPERATING.md).
 
----
+## Honest about what this is
 
-This is the public, sanitized version of a real working system. The stakes here
-are narrow and specific: an unattended agent that says "done" when it isn't, and
-a bad change already merged before anyone looks. The whole repo exists to make
-that one word mean something the agent can't fake.
+This is a working prototype and a **trust layer, not a security sandbox**. It
+holds against a cooperative agent that cuts corners under pressure; it is
+defeatable by one actively trying to escape — the bash guard is a pattern
+matcher, and no regex over a shell string can stop an agent that writes a file
+through a language interpreter. That class is architectural; the optional
+[`isolate/`](isolate/) companion closes it by running the loop in a container
+with the trust layer mounted read-only and the network off. Every hole reproduced
+in a disposable sandbox — what's closed, what's hardened, and the one kept
+open by design — is written up in [`AUDIT.md`](AUDIT.md). It's a real
+self-audit, not a disclaimer.
+
+This is the public, sanitized version of a real working system. The whole repo
+exists to make one word — "done" — mean something the agent can't fake.
